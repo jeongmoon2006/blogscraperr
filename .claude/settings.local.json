@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:blog.naver.com)",
+      "Bash(.venv/Scripts/pip install:*)",
+      "Bash(.venv/Scripts/playwright install:*)"
+    ]
+  }
+}
