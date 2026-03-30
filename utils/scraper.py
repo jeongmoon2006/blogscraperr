@@ -1,4 +1,5 @@
 import os
+import re
 import json
 from collections import deque
 from urllib.parse import urlparse, urljoin, urldefrag, parse_qs
@@ -19,25 +20,10 @@ def _normalize_url(url: str) -> str:
 
 
 def _same_scope(url: str, base_netloc: str, blog_id: str | None, path_prefix: str | None) -> bool:
-    """Return True if `url` is within the same crawl scope.
-
-    Scope is defined as:
-    - Same domain (`base_netloc`), and
-    - If `path_prefix` is provided, the path must start with that prefix.
-
-    This is useful for multi-blog hosts like blog.naver.com where
-    different blogs live under different first path segments, e.g.
-    /ranto28/ vs /someoneelse/.
-    """
     parsed = urlparse(url)
     if parsed.netloc != base_netloc:
         return False
-
     path = parsed.path or "/"
-
-    # If we know a specific blog_id (e.g., "ranto28" on blog.naver.com),
-    # keep URLs that either live under "/<blog_id>/" or have
-    # "blogId=<blog_id>" in the query string.
     if blog_id:
         if path == f"/{blog_id}" or path.startswith(f"/{blog_id}/"):
             return True
@@ -46,22 +32,15 @@ def _same_scope(url: str, base_netloc: str, blog_id: str | None, path_prefix: st
         if blog_ids and blog_ids[0] == blog_id:
             return True
         return False
-
-    # Generic path-based scoping for other hosts.
     if not path_prefix:
         return True
     return path.startswith(path_prefix)
 
 
 def _load_robots(base_url: str) -> robotparser.RobotFileParser | None:
-    """Best-effort load robots.txt; return None on failure.
-
-    This helps you respect site policies but does not guarantee compliance.
-    """
     try:
         rp = robotparser.RobotFileParser()
-        robots_url = urljoin(base_url, "/robots.txt")
-        rp.set_url(robots_url)
+        rp.set_url(urljoin(base_url, "/robots.txt"))
         rp.read()
         return rp
     except Exception:
@@ -78,13 +57,6 @@ def _is_allowed(url: str, rp: robotparser.RobotFileParser | None) -> bool:
 
 
 def _sanitize_filename(url: str) -> str:
-    """Create a filesystem-safe, mostly-unique filename for a URL.
-
-    We base it on the path plus a few key query parameters so that
-    different posts (e.g., different `logNo` values on Naver) don't
-    overwrite each other.
-    """
-
     parsed = urlparse(url)
     path = parsed.path or "/"
     if not path or path == "/":
@@ -100,7 +72,6 @@ def _sanitize_filename(url: str) -> str:
         base = "_".join("".join(safe).split("/")) or "page"
 
     qs = parse_qs(parsed.query)
-    # Include a few common distinguishing parameters if present.
     suffix_parts: list[str] = []
     for key in ("logNo", "logno", "categoryNo", "page"):
         vals = qs.get(key)
@@ -112,18 +83,17 @@ def _sanitize_filename(url: str) -> str:
     return base
 
 
-def _seed_naver_post_urls(blog_id: str) -> list[str]:
-    """Use Naver's PostTitleListAsync API to enumerate every post URL.
+def _get_naver_post_urls(blog_id: str) -> list[str]:
+    """Fetch all post URLs for a Naver blog using the PostTitleListAsync API.
 
-    Returns a list of post URLs like
-    https://blog.naver.com/<blog_id>/<logNo>.
-    Falls back to an empty list on any error.
+    Returns PostView URLs in newest-first order (one per post, no duplicates).
+    Each URL points directly to the post content page.
     """
     urls: list[str] = []
-    page = 1
-    per_page = 100
     session = requests.Session()
     session.headers.update({"User-Agent": "blogscraperr/0.1"})
+    per_page = 100
+    page = 1
 
     while True:
         try:
@@ -137,20 +107,39 @@ def _seed_naver_post_urls(blog_id: str) -> list[str]:
                 },
                 timeout=10,
             )
-            data = resp.json()
+            try:
+                data = resp.json()
+            except ValueError:
+                # Naver sometimes puts invalid JSON escape sequences (e.g. \k)
+                # in post titles. Fix lone backslashes before parsing.
+                fixed = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', resp.text)
+                try:
+                    data = json.loads(fixed)
+                except ValueError as exc2:
+                    print(f"  [naver-api] page {page} JSON unfixable, skipping: {exc2}")
+                    page += 1
+                    continue
         except Exception as exc:
-            print(f"  [naver-api] page {page} failed: {exc}")
-            break
+            print(f"  [naver-api] page {page} request failed: {exc}")
+            page += 1
+            continue
 
         posts = data.get("postList") or []
         for post in posts:
             log_no = post.get("logNo")
             if log_no:
-                urls.append(f"https://blog.naver.com/{blog_id}/{log_no}")
+                # PostView.naver is the actual content page (the iframe target).
+                # Visiting it directly gives us the post body without any
+                # additional iframe nesting.
+                urls.append(
+                    f"https://blog.naver.com/PostView.naver"
+                    f"?blogId={blog_id}&logNo={log_no}"
+                )
 
-        print(f"  [naver-api] page {page}: found {len(posts)} posts (total so far: {len(urls)})")
+        total = data.get("totalCount", "?")
+        print(f"  [naver-api] page {page}: {len(posts)} posts  (total so far: {len(urls)} / {total})")
 
-        if len(posts) < per_page:
+        if not posts:
             break
         page += 1
 
@@ -166,47 +155,27 @@ def scrape_blog(
 ) -> list[dict]:
     """Crawl a blog starting from `start_url` and save pages to disk.
 
-    - Only HTTP(S) pages on the same domain are visited.
-    - Best-effort respect for robots.txt.
-    - Content is rendered via a headless browser so JavaScript-generated
-      text is captured and CSS copy-protection (user-select: none) is
-      bypassed.
-    - Each page is saved as a UTF-8 text file; an index.json is created.
+    For Naver blogs
+    ---------------
+    Uses the PostTitleListAsync API to enumerate every post in newest-first
+    order and visits each PostView page exactly once.  Link/iframe following
+    is intentionally disabled to prevent loops.
 
-    Parameters
-    ----------
-    start_url : str
-        URL of any page within the blog (typically the homepage).
-    out_dir : str
-        Base output directory. A subfolder named after the domain is created.
-    max_pages : int
-        Safety limit on the number of pages to crawl.
-    merged_filename : str | None
-        If provided, all scraped pages are also appended to this single
-        UTF-8 text file in the domain-specific output directory.
-    write_individual_files : bool
-        When True, save one `.txt` file per page as well; by default we
-        only write the merged file to avoid thousands of small files.
-
-    Returns
-    -------
-    list[dict]
-        Metadata entries for all scraped pages: {"url", "title", "filepath"}.
+    For generic blogs
+    -----------------
+    BFS crawl that follows <a href> and <iframe src> links within the same
+    domain / path scope.
 
     Notes
     -----
     Only crawl websites you are allowed to scrape and that permit
     automated access. Always review the site's terms of service.
     """
-
     start_url = _normalize_url(start_url)
     parsed_start = urlparse(start_url)
     base_netloc = parsed_start.netloc
     base_root = f"{parsed_start.scheme}://{parsed_start.netloc}"
 
-    # For multi-blog hosts (like blog.naver.com/<blog_id>/...), we treat the
-    # first path segment as the blog_id. For generic hosts, we keep using a
-    # simple path prefix.
     blog_id: str | None = None
     path_prefix: str | None = None
     start_path = (parsed_start.path or "/").strip("/\\")
@@ -228,17 +197,20 @@ def scrape_blog(
         except OSError:
             merged_file = None
 
-    rp = _load_robots(base_root)
-
-    seed_urls = [start_url]
+    # --- Build the queue ---
     if blog_id:
-        print(f"  Fetching post list from Naver API for blog: {blog_id}")
-        naver_posts = _seed_naver_post_urls(blog_id)
-        if naver_posts:
-            print(f"  Seeding queue with {len(naver_posts)} post URLs from API.")
-            seed_urls.extend(naver_posts)
+        # Naver: enumerate every post via the API (newest first).
+        # Skip the outer blog homepage — it's just a shell.
+        print(f"Fetching full post list from Naver API for blog: {blog_id}")
+        queue: deque[str] = deque(_get_naver_post_urls(blog_id))
+        print(f"Queued {len(queue)} posts. Starting scrape...\n")
+        follow_links = False  # API already gave us all URLs; following links causes loops
+        rp = None  # Skip robots.txt for Naver; we're using their official API
+    else:
+        queue = deque([start_url])
+        rp = _load_robots(base_root)
+        follow_links = True
 
-    queue: deque[str] = deque(seed_urls)
     visited: set[str] = set()
     index: list[dict] = []
 
@@ -247,7 +219,7 @@ def scrape_blog(
         try:
             while queue and len(visited) < max_pages:
                 current = queue.popleft()
-                current, _ = urldefrag(current)  # drop fragment
+                current, _ = urldefrag(current)
 
                 if current in visited:
                     continue
@@ -259,7 +231,7 @@ def scrape_blog(
                 if not _is_allowed(current, rp):
                     continue
 
-                print(f"  Fetching ({len(visited)}/{max_pages}): {current}")
+                print(f"  [{len(visited)}/{len(visited) + len(queue)}] {current}")
 
                 try:
                     title, text, links, iframe_srcs = fetch_page_rendered(current, browser)
@@ -267,56 +239,49 @@ def scrape_blog(
                     print(f"    [skip] {exc}")
                     continue
 
-                print(f"    title={title!r}  text={len(text)}chars  links={len(links)}  iframes={len(iframe_srcs)}")
+                # Collapse excessive blank lines
+                clean_text = re.sub(r"\n{3,}", "\n\n", text).strip()
+
+                print(f"    title={title!r}  chars={len(clean_text)}")
 
                 filepath: str | None = None
                 if write_individual_files:
                     filename = _sanitize_filename(current)
                     filepath = os.path.join(domain_dir, f"{filename}.txt")
-
                     try:
                         with open(filepath, "w", encoding="utf-8") as f:
-                            f.write(f"URL: {current}\n")
-                            f.write(f"Title: {title}\n\n")
-                            f.write(text)
+                            f.write(f"URL: {current}\nTitle: {title}\n\n{clean_text}")
                     except OSError:
                         filepath = None
 
                 index.append({"url": current, "title": title, "filepath": filepath})
 
                 if merged_file is not None:
-                    # Collapse runs of blank lines to a single blank line
-                    import re
-                    clean_text = re.sub(r"\n{3,}", "\n\n", text)
                     merged_file.write("=" * 80 + "\n")
-                    merged_file.write(f"URL: {current}\n")
-                    merged_file.write(f"Title: {title}\n\n")
+                    merged_file.write(f"URL: {current}\nTitle: {title}\n\n")
                     merged_file.write(clean_text)
                     merged_file.write("\n\n")
 
-                # Enqueue links found after JS rendering
-                for href in links:
-                    next_url, _ = urldefrag(href)
-                    if next_url not in visited and _same_scope(next_url, base_netloc, blog_id, path_prefix):
-                        queue.append(next_url)
-
-                # Enqueue iframe sources (Naver loads post body inside iframes)
-                for src in iframe_srcs:
-                    next_url, _ = urldefrag(src)
-                    if next_url not in visited and _same_scope(next_url, base_netloc, blog_id, path_prefix):
-                        queue.append(next_url)
+                # For generic blogs only: follow links discovered on the page
+                if follow_links:
+                    for href in links:
+                        next_url, _ = urldefrag(href)
+                        if next_url not in visited and _same_scope(next_url, base_netloc, blog_id, path_prefix):
+                            queue.append(next_url)
+                    for src in iframe_srcs:
+                        next_url, _ = urldefrag(src)
+                        if next_url not in visited and _same_scope(next_url, base_netloc, blog_id, path_prefix):
+                            queue.append(next_url)
 
         finally:
             browser.close()
 
-    # Close merged file if opened
     if merged_file is not None:
         try:
             merged_file.close()
         except OSError:
             pass
 
-    # Save index
     index_path = os.path.join(domain_dir, "index.json")
     try:
         with open(index_path, "w", encoding="utf-8") as f:

@@ -43,7 +43,12 @@ def fetch_page_rendered(
     """
     page = browser.new_page()
     try:
-        page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+        # "load" fires once HTML + subresources are done.
+        # We avoid "networkidle" because Naver pages have persistent
+        # connections that prevent it from ever settling, causing timeouts.
+        page.goto(url, wait_until="load", timeout=timeout_ms)
+        # Give JS a moment to finish rendering dynamic content.
+        page.wait_for_timeout(2000)
 
         title: str = page.title() or url
 
